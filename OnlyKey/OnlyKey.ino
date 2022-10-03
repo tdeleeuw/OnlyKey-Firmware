@@ -1,5 +1,5 @@
 /* 
- * Copyright (c) 2015-2020, CryptoTrust LLC.
+ * Copyright (c) 2015-2022, CryptoTrust LLC.
  * All rights reserved.
  * 
  * Author : Tim Steiner <t@crp.to>
@@ -75,14 +75,13 @@
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-
 /*************************************/
 //Firmware Build Options
 /*************************************/
 //#define DEBUG //Enable Serial Monitor, debug firmware
-//#define STD_VERSION //Define for STD edition firmare, undefine for IN TRVL edition firmware
+#define STD_VERSION //Define for STD edition firmare, undefine for IN TRVL edition firmware
 #define OK_Color //Define for hardware with color LED
-//#define FACTORYKEYS // Attestation key and other keys encrypted using CHIP ID and RNG for unique per device
+//#define FACTORYKEYS2 // Attestation key and other keys encrypted using CHIP ID and RNG for unique per device
 /*************************************/
 //Standard Libraries 
 /*************************************/
@@ -233,6 +232,8 @@ extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
 #endif
 extern uint8_t pending_operation;
 uint8_t modkey;
+extern uint8_t onlykeyhw;
+extern uint8_t Duo_config[2];
 
 extern "C" {
   int _getpid(){ return -1;}
@@ -261,9 +262,9 @@ void setup() {
   BLINKPIN=6;
   TOUCHPIN1=1; // #define CORE_PIN1_CONFIG  PORTB_PCR17
   TOUCHPIN2=22; //#define CORE_PIN22_CONFIG  PORTC_PCR1
-  TOUCHPIN3=23; //#define CORE_PIN23_CONFIG  PORTC_PCR2 OnlyKey Go Button #1
+  TOUCHPIN3=23; //#define CORE_PIN23_CONFIG  PORTC_PCR2 OnlyKey DUO Button #1
   TOUCHPIN4=17; //#define CORE_PIN17_CONFIG  PORTB_PCR1
-  TOUCHPIN5=15; //#define CORE_PIN15_CONFIG  PORTC_PCR0 OnlyKey Go Button #2
+  TOUCHPIN5=15; //#define CORE_PIN15_CONFIG  PORTC_PCR0 OnlyKey DUO Button #2
   TOUCHPIN6=16; //#define CORE_PIN16_CONFIG  PORTB_PCR0
   ANALOGPIN1=A0; //#define CORE_PIN14_CONFIG PORTD_PCR1
   ANALOGPIN2=A7; //#define CORE_PIN21_CONFIG PORTD_PCR6
@@ -291,46 +292,51 @@ void setup() {
   //FSEC currently set to 0x44, everything disabled except mass erase https://forum.pjrc.com/threads/28783-Upload-Hex-file-from-Teensy-3-1
   if (FTFL_FSEC!=0x44) {
     // First time starting up, three steps to complete:
-    // 1) Read factory device keys and set custom device keys
+    // 1) Read factory loaded device keys and generate custom device keys
     // Get factory default flash contents
-    #ifdef FACTORYKEYS
-    // FACTORYKEYS isn't used yet
-    // TODO handle if power is removed during writing encrypted keys
-    // - save encrypted keys to 1st free storage sector
-    // - wipe original flash location in 1st free flash sector when FTFL_FSEC==0x44
-    okcore_flashget_common(ctap_buffer, (unsigned long *)factorysectoradr, 2048);
+    #ifdef FACTORYKEYS2
+    okcore_flashget_common(ctap_buffer, (unsigned long *)factorysectoradr, 1025);
     #ifdef DEBUG
-    Serial.println("Factory Keys");
-    byteprint(ctap_buffer+1536, 512);
+    Serial.println("Factory Key Values");
+    byteprint(ctap_buffer, 1025);
     #endif
-    // Hash factory bytes with unique chip ID
-    SHA256_CTX hash;
-    for (int i=0; i<=14; i++) {
-      sha256_init(&hash);
-      sha256_update(&hash, ctap_buffer+1536+(32*i), 32);
-      sha256_update(&hash, ctap_buffer+1536+(32*(i+1)), 32);
-      sha256_update(&hash, (uint8_t*)ID, 36);
-      sha256_update(&hash, (uint8_t*)&analog1, 4);
-      sha256_update(&hash, (uint8_t*)&analog2, 4);
-      sha256_final(&hash, ctap_buffer+1536+(32*i));
-    }
-    #ifdef DEBUG
-    Serial.println("Custom Keys");
-    byteprint(ctap_buffer+1536, 512);
-    #endif
-    // Write everything to flash
-    okcore_flashsector(ctap_buffer, (unsigned long *)factorysectoradr, 2048);
-    // Encrypt attestation key 
-    okcrypto_aes_gcm_encrypt2(ctap_buffer+(1536+480), attestation_kek_iv, attestation_kek, 32);
-    // Set flag
-    ctap_buffer[1536+435]=0x01;
-    // Write encrypted attestation key to flash
-    okcore_flashsector(ctap_buffer, (unsigned long *)factorysectoradr, 2048); 
-    #ifdef DEBUG
-    Serial.println("Encrypted Attestation Key");
-    byteprint(ctap_buffer+1536, 512);
-    #endif
-    #endif
+    if (ctap_buffer[480] != 0xFF) { // Attestation key loaded
+      // Hash factory bytes with unique chip ID and random 
+      SHA256_CTX hash;
+      for (int i=0; i<=14; i++) {
+        analog1 = analogRead(ANALOGPIN1);
+        analog2 = analogRead(ANALOGPIN1);
+        sha256_init(&hash);
+        sha256_update(&hash, ctap_buffer+(32*i), 32);
+        sha256_update(&hash, ctap_buffer+(32*(i+1)), 32);
+        sha256_update(&hash, (uint8_t*)ID, 36);
+        sha256_update(&hash, (uint8_t*)&analog1, 4);
+        sha256_update(&hash, (uint8_t*)&analog2, 4);
+        sha256_final(&hash, ctap_buffer+(32*i));
+      }
+      #ifdef DEBUG
+      Serial.println("KDF Hashed Factory Values");
+      byteprint(ctap_buffer, 512);
+      #endif
+      // Write everything to flash
+      if (*certified_hw != 1) {
+        // Encrypt attestation key with generated KEK
+        ctap_buffer[435]=3;
+        //Write keys
+        okcore_flashset_common(ctap_buffer, (unsigned long *)enckeysectoradr, 436); 
+        okcrypto_aes_gcm_encrypt2(ctap_buffer+480, ctap_buffer+436, ctap_buffer+448, 32, true);
+        //Write encrypted contents to flash
+        okcore_flashset_common(ctap_buffer, (unsigned long *)enckeysectoradr, 513); 
+        // Set write flag 
+        ctap_buffer[435]=1;
+        // Write flag to flash
+        okcore_flashset_common(ctap_buffer, (unsigned long *)enckeysectoradr, 513); 
+      }
+      // Erase factory keys
+      memset(ctap_buffer, 0, 2048);
+      okcore_flashset_common(ctap_buffer, (unsigned long *)factorysectoradr, 512); 
+    } 
+    #endif // end FACTORYKEYS
     // 2) Store factory firmware hash for integrity verification
     //create hash of firmware in hash buffer
     #ifdef STD_VERSION
@@ -340,7 +346,7 @@ void setup() {
     }
     memset(ctap_buffer, 0, 2048);
     #endif
-    // 3) Enable flash security
+    // 3) Enable flash security after writing
     int nn = 0;
     nn=flashSecurityLockBits();
     #ifdef DEBUG
@@ -351,6 +357,7 @@ void setup() {
   }
   if(!initcheck) {
       wipeEEPROM();
+      eeprom_write_byte((unsigned char *)1984, (OKversionmaj[0] - '0')); //write fwvermaj, prevents downgrade to previous majver
       okeeprom_eeset_timeout((uint8_t*)TIMEOUT); //Default lockout 30 min
       unlocked = true; //Flash is not protected, First time use
       initialized = false;
@@ -361,7 +368,7 @@ void setup() {
         okcore_flashget_pinhashpublic ((uint8_t*)p1hash, 32); //store PIN hash
         okcore_flashget_selfdestructhash ((uint8_t*)sdhash); //store self destruct PIN hash
         okcore_flashget_2ndpinhashpublic ((uint8_t*)p2hash); //store plausible deniability PIN hash
-        okeeprom_eeget_typespeed((uint8_t*)TYPESPEED);
+        okeeprom_eeget_typespeed((uint8_t*)TYPESPEED, 0);
         okeeprom_eeget_modkey(&mod_keys_enabled);
         #ifdef DEBUG
         Serial.println("typespeed = ");
@@ -398,7 +405,7 @@ void setup() {
   RNG.stir((uint8_t *)&analog2, 2, 4);
   #ifdef DEBUG
   Serial.print("EEPROM Used ");
-  Serial.println(EEpos_ctap_authstate+208);
+  Serial.println(EEpos_slottypespeed+12);
   Serial.println(FTFL_FSEC, HEX);
   #endif
   rngloop(); //Start RNG
@@ -414,18 +421,18 @@ void setup() {
   #endif
   SoftTimer.add(&taskKey);
   
-  if (HW_ID==OK_GO && initialized == true) {
-    if (password.profile1hashevaluate() || password.profile2hashevaluate()) {
-      payload(10); 
-    } 
+  if (onlykeyhw==OK_HW_DUO) {
+      if (!initcheck) {
+        //Default no challenge code required for DUO
+        derived_key_challenge_mode = 1;
+        stored_key_challenge_mode = 1;
+        okeeprom_eeset_derived_key_challenge_mode(&derived_key_challenge_mode); 
+        okeeprom_eeset_stored_key_challenge_mode(&stored_key_challenge_mode);
+      } 
+      if (initialized == true && password.profile1hashevaluate()) {
+          payload(10); 
+      }
   }
-
-  #ifndef DEBUG
-  // Disable OK_GO hardware for production
-  if (HW_ID==OK_GO) {
-    CPU_RESTART();
-  }
-  #endif
 
 }
 
@@ -451,6 +458,15 @@ void checkKey(Task* me) {
     CPU_RESTART(); //Reboot
     }
   }
+
+  #ifndef STD_VERSION
+  // Disable OK_HW_DUO hardware for IN_TRVL firmware
+  if (onlykeyhw==OK_HW_DUO) {
+    eeprom_write_byte(0x00, 1); //Go to bootloader
+    eeprom_write_byte((unsigned char *)0x01, 1); //Firmware ready to load
+    CPU_RESTART(); //Reboot
+  }
+  #endif
 
   if (setBuffer[8] == 1 && (!isfade || configmode)) //Done receiving packets
   {                 
@@ -521,6 +537,9 @@ void sendKey(Task* me) {
       Keyboard.end();
       SoftTimer.remove(&taskKB);
       SoftTimer.add(&taskKey);
+      // Set back to default type speed
+      okeeprom_eeget_typespeed((uint8_t*)TYPESPEED, 0);
+      if (TYPESPEED[0]==0) TYPESPEED[0] = 4;
       return;
     }
     else if ((uint8_t)*pos == 1) {
@@ -606,8 +625,8 @@ void sendKey(Task* me) {
 void payload(int duration) {   
     if (!unlocked) {
       // OnlyKey Go has only 3 buttons, longer press to enter PIN of 4 - 6
-      if (HW_ID==OK_GO && duration >= 21) { 
-        // <1 sec OK_GO buttons 1,2,3 = 4,5,6
+      if (onlykeyhw==OK_HW_DUO && duration >= 21) { 
+        // <1 sec OK_HW_DUO buttons 1,2,3 = 4,5,6
         button_selected = button_selected + 3;
       }
       #ifdef OK_Color
@@ -706,14 +725,14 @@ void payload(int duration) {
       wipe_usb_buffer(); // Wipe old responses
       return;
     } else if (!initialized && duration >= 85 && button_selected=='1' && profilemode!=NONENCRYPTEDPROFILE) {
-      if (HW_ID==OK_GO) okcore_quick_setup(KEYBOARD_ONLYKEY_GO_NO_BACKUP);
+      if (onlykeyhw==OK_HW_DUO) okcore_quick_setup(KEYBOARD_ONLYKEY_DUO_NO_BACKUP);
       else okcore_quick_setup(KEYBOARD_MANUAL_PIN_SET);
       return;
     } else if (!initialized && duration >= 85 && button_selected=='2' && profilemode!=NONENCRYPTEDPROFILE) {
-      if (HW_ID==OK_GO) okcore_quick_setup(KEYBOARD_ONLYKEY_GO);
+      if (onlykeyhw==OK_HW_DUO) okcore_quick_setup(KEYBOARD_ONLYKEY_DUO_BACKUP);
       else okcore_quick_setup(KEYBOARD_AUTO_PIN_SET);
       return;
-    } else if (!initialized && duration >= 85 && button_selected=='3' && profilemode!=NONENCRYPTEDPROFILE && HW_ID!=OK_GO) {
+    } else if (!initialized && duration >= 85 && button_selected=='3' && profilemode!=NONENCRYPTEDPROFILE) {
       okcore_quick_setup(0); //Setup with keyboard prompt
       return;
     } else if (pin_set==0 && !initcheck) {
@@ -762,7 +781,7 @@ void payload(int duration) {
         return;
     } else if (pin_set==10) {
         cancelfadeoffafter20();
-        if (button_selected=='1' && HW_ID!=OK_GO) okcore_quick_setup(KEYBOARD_MANUAL_PIN_SET); //Manual
+        if (button_selected=='1') okcore_quick_setup(KEYBOARD_MANUAL_PIN_SET); //Manual
         else okcore_quick_setup(KEYBOARD_AUTO_PIN_SET); //Manual
         return;
     }
@@ -828,23 +847,37 @@ void payload(int duration) {
             hidprint("Error incorrect challenge was entered");
             analogWrite(BLINKPIN, 255); //LED ON
             return;
-        } else if (duration >= 72 && (duration < 126 || HW_ID!=OK_GO)  && button_selected=='1' && !isfade) {
+        } else if (duration < 180 && duration >= 72 && button_selected=='1' && !isfade) {
             // Backup <4 sec 
             SoftTimer.remove(&taskKey);
             backup();
             SoftTimer.add(&taskKey);
             return;
-        } else if (((duration >= 72 && duration < 126) || (HW_ID==OK_GO && duration >= 270) || (HW_ID!=OK_GO && duration >= 140)) && button_selected=='2' && !isfade) {
+        } else if (onlykeyhw==OK_HW_DUO && duration >= 360 && button_selected=='2' && configmode==true) {
+          factorydefault();
+        } else if (duration >= 72 && button_selected=='2' && !isfade) {
             // Slot Labels <4 sec 
             get_slot_labels(1);
-            // Print key labels <15 sec OK_GO, <8 sec OK
             if (duration >= 140) get_key_labels(1);
             return;
-        } else if (duration >= 90 && button_selected=='2' && configmode==true && HW_ID==OK_GO) {
-            factorydefault(); //OnlyKey Go while in config mode wipe 
-            return;
-        } else if (duration >= 72 && (duration < 126 || HW_ID!=OK_GO) && button_selected=='3' && !isfade) {
+        } else if (duration >= 72 && button_selected=='3' && !isfade) {
             // Lock and/or switch profiles <4 sec
+            if (onlykeyhw==OK_HW_DUO && duration < 180) {
+              if (Duo_config[1] == 0){ // Profile 1
+                Profile_Offset = 84; //Profile 2 Blue
+                Duo_config[1] = 1;
+              } else if (Duo_config[1] == 1){ // Profile 2 
+                Profile_Offset = -42; //Profile 3 Yellow
+                Duo_config[1] = 2;
+              } else if (Duo_config[1] == 2){ // Profile 3
+                Profile_Offset = 128; //Profile 4 Purple
+                Duo_config[1] = 3;
+              } else if (Duo_config[1] == 3){ // Profile 4
+                Profile_Offset = 0; //Profile 1 Green
+                Duo_config[1] = 0;
+              }
+              return;
+            }
             unlocked = false;
             firsttime = true;
             password.reset(); //reset the guessed password to NULL
@@ -852,33 +885,21 @@ void payload(int duration) {
             memset(profilekey, 0, 32);        
             SoftTimer.add(&taskInitialized);
             button_selected=0;
-            if (HW_ID==OK_GO) {
-                if (!Profile_Offset && password.profile2hashevaluate()){
-                  Profile_Offset=1;
-                  payload(10);
-                } else if (Profile_Offset && password.profile1hashevaluate()){
-                  payload(10);
-                }
-            } else {
-              CPU_RESTART(); 
-            }
+            CPU_RESTART(); 
             return;
         } 
-        else if (((HW_ID==OK_GO && duration >= 270 && button_selected=='3') || (HW_ID!=OK_GO && duration >= 72 && button_selected=='6')) && !isfade) {
-          // Config mode <15 sec OK_GO, <4 sec OK
+        else if (((onlykeyhw==OK_HW_DUO && duration >= 180 && button_selected=='1') || (onlykeyhw!=OK_HW_DUO && duration >= 72 && button_selected=='6')) && !isfade) {
+          // Config mode 
           integrityctr1++;
           configmode=true;
-          unlocked = false;
-          firsttime = true;
-          password.reset(); //reset the guessed password to NULL
-          integrityctr2++;
-          pass_keypress=1;
-          if (HW_ID==OK_GO) {
-            button_selected=0;
-             if (password.profile1hashevaluate() || password.profile2hashevaluate()) {
-              payload(10); 
-            } 
+          if (Duo_config[0]!=1) {
+            unlocked = false;
+            firsttime = true;
+            password.reset(); //reset the guessed password to NULL
+            pass_keypress=1;
+            SoftTimer.add(&taskInitialized);
           }
+          integrityctr2++;
           return;
         }
       #endif
@@ -888,17 +909,6 @@ void payload(int duration) {
     #else
     analogWrite(BLINKPIN, 0); //LED OFF
     #endif
-
-   // OnlyKey Go has only 3 buttons, longer press to activate additional C and D slots
-    if (HW_ID==OK_GO && duration >= 180 && duration < 269) { 
-      // <10 sec OK_GO slots 1d - 3d, maps to onlykey slots 4b - 6b
-      button_selected = button_selected + 3;
-      duration = 21; // gen_hold(); 
-    } else if (HW_ID==OK_GO && duration >= 126) { 
-      // <7 sec OK_GO slots 1c - 3c, maps to onlykey slots 4a - 6a
-      button_selected = button_selected + 3;
-      duration = 10; // gen_press(); 
-    }  
       
     if (duration <= 20 && !configmode) {
       gen_press();
@@ -962,8 +972,13 @@ void payload(int duration) {
 /*************************************/
 void gen_press(void) {
   int slot;
-  if (profilemode) {
+
+  if (profilemode || Duo_config[1] == 2) {
     slot=(button_selected-'0')+12;
+  } else if (Duo_config[1] == 1) {
+    slot=(button_selected-'0')+6;
+  } else if (Duo_config[1] == 3) {
+    slot=(button_selected-'0')+18;
   } else {
     slot=button_selected-'0';
   }
@@ -974,12 +989,22 @@ void gen_press(void) {
 /*************************************/
 void gen_hold(void) {
   int slot;
-  if (profilemode) {
+  if (profilemode || Duo_config[1] == 2) {
     slot=(button_selected-'0')+12;
+  } else if (Duo_config[1] == 1) {
+    slot=(button_selected-'0')+6;
+  } else if (Duo_config[1] == 3) {
+    slot=(button_selected-'0')+18;
   } else {
     slot=button_selected-'0';
   }
-      process_slot(slot+6);
+
+  if (onlykeyhw==OK_HW_DUO){
+    process_slot(slot+3);
+  } else {
+    process_slot(slot+6);
+  }
+      
 }
 /*************************************/
 //Load Set Values to Keybuffer
@@ -1013,10 +1038,14 @@ void process_slot(int s) {
         lock_ok_and_screen ();
         return;
       }
+      okeeprom_eeget_typespeed((uint8_t*)TYPESPEED, slot);
+      if (TYPESPEED[0]==0) okeeprom_eeget_typespeed((uint8_t*)TYPESPEED, 0);
+      if (TYPESPEED[0]==0) TYPESPEED[0] = 4;
+      
       okeeprom_eeget_addchar(&addchar5, slot);
       #ifdef DEBUG
       Serial.println("Additional Character");
-      Serial.println(addchar5);
+      Serial.println(addchar5); 
       #endif
       addchar1 = addchar5 & 0x3; //After Username
       addchar2 = (addchar5 >> 4) & 0x3; //After Password
@@ -1219,7 +1248,7 @@ void process_slot(int s) {
       otplength = okeeprom_eeget_2FAtype(ptr, slot);
       if(temp[0] > 0)
       {
-        if(temp[0] == 103) { //Google Auth
+        if(temp[0] == MFAGOOGLEAUTH) { //Google Auth
           #ifdef DEBUG
           Serial.println("Reading TOTP Key from Flash...");
           #endif
@@ -1261,7 +1290,7 @@ void process_slot(int s) {
           index=index+6;
           memset(temp, 0, 64); //Wipe all data from buffer
         }
-        if(temp[0] == 121 && profilemode!=NONENCRYPTEDPROFILE) {
+        if(temp[0] == MFAOLDYUBIOTP && profilemode!=NONENCRYPTEDPROFILE) {
           #ifdef DEBUG
           Serial.println("Generating Yubico OTP Legacy...");
           #endif
@@ -1270,7 +1299,7 @@ void process_slot(int s) {
           index=index+44;
           #endif
         }
-        if(temp[0] == 89  && profilemode!=NONENCRYPTEDPROFILE) {
+        if((temp[0] == MFAYUBIOTPandHMACSHA1 || temp[0] == MFAYUBIOTP) && profilemode!=NONENCRYPTEDPROFILE) {
           #ifdef DEBUG
           Serial.println("Generating Yubico OTP...");
           #endif
@@ -1280,7 +1309,7 @@ void process_slot(int s) {
           index=index+32+(publen*2);
           #endif
         }
-        if(temp[0] == 117 && profilemode!=NONENCRYPTEDPROFILE) { //U2F
+        if(temp[0] == MFAOLDU2F && profilemode!=NONENCRYPTEDPROFILE) { //U2F
           keybuffer[index] = 9;
           index++;
         }
@@ -1318,18 +1347,22 @@ void process_slot(int s) {
 }
 
 void sendInitialized(Task* me) {
-    if (HW_ID==OK_GO){
+    if (onlykeyhw==OK_HW_DUO){
       int n = RawHID.recv(recv_buffer, 0); // 0 timeout = do not wait
-      if (n && recv_buffer[4] == OKPIN && recv_buffer[5]>='0' && initialized == true && unlocked == false && HW_ID==OK_GO) {
+      if (n && recv_buffer[4] == OKPIN && recv_buffer[5]>='0' && initialized == true && unlocked == false && onlykeyhw==OK_HW_DUO) {
         unlocked = false;
         firsttime = true;
         password.reset(); //reset the guessed password to NULL
-        okcore_pin_login(); // Received PIN Login Attempt for OnlyKey Go
+        okcore_pin_login(); // Received PIN Login Attempt for OnlyKey Duo
         pass_keypress=10;
+        button_selected=0;
         payload(10); // Try the PIN
         memset(recv_buffer, 0, sizeof(recv_buffer));
+        if (unlocked == true) {
+          hidprint(HW_MODEL(UNLOCKED));
+        }
       } else {
-        hidprint("INITIALIZED-G");
+        hidprint("INITIALIZED-D");
       }
     } else hidprint("INITIALIZED");
     #ifdef DEBUG
@@ -1472,5 +1505,6 @@ void exceeded_login_attempts() {
     blink(5);
     }
 }
+
 
 
